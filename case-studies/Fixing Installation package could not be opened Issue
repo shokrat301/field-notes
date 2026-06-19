@@ -1,0 +1,482 @@
+Fixing Persistent Windows Installer Popups at Startup After Browser Hijacker Cleanup
+
+## Summary
+
+This issue started as a recurring Windows Installer popup appearing every time the PC rebooted. Three small Windows Installer error windows appeared at login with the message:
+
+> This installation package could not be opened. Verify that the package exists and that you can access it, or contact the application vendor to verify that this is a valid Windows Installer package.
+
+At first, the issue looked like leftover Google Chrome installer corruption because Autoruns showed several broken Chrome-related startup entries. However, deeper inspection showed the real cause was not Chrome and not Microsoft Gaming Services. The root cause was leftover browser-hijacker persistence through malicious scheduled tasks launching missing MSI installers from suspicious ProgramData folders.
+
+---
+
+## Background
+
+Earlier, the system had a Chrome browser hijacker that redirected searches through suspicious domains such as:
+
+* `nextgeeker.com`
+* `directsearchapp.com`
+
+The hijacker had used multiple persistence techniques:
+
+* Fake Chrome profile paths
+* Browser search-engine hijack
+* Suspicious Chrome policies
+* Fake browser-like folders
+* Scheduled tasks
+* Microsoft Defender exclusions
+* Locked leftover Chrome installation files
+
+Previously discovered suspicious paths included:
+
+```text
+%LOCALAPPDATA%\DGoogle
+%LOCALAPPDATA%\DDapps
+%LOCALAPPDATA%\EMicrosoft
+C:\ProgramData\Chromnius
+C:\ProgramData\ChromniusEdge
+C:\Program Files (x86)\GeneralAISupport2Solutions
+```
+
+After the original cleanup, the browser hijack was gone, but Windows Installer popups started appearing after reboot.
+
+---
+
+## Initial Symptom
+
+On every reboot/login, Windows displayed three installer error windows.
+
+The error message was:
+
+```text
+This installation package could not be opened.
+Verify that the package exists and that you can access it,
+or contact the application vendor to verify that this is a valid Windows Installer package.
+```
+
+Because three windows appeared, the suspicion was that three startup/persistence entries were trying to launch missing installer packages.
+
+---
+
+## Tools Used
+
+* Microsoft Sysinternals Autoruns
+  https://learn.microsoft.com/en-us/sysinternals/downloads/autoruns
+
+* Windows Event Viewer
+
+* PowerShell Administrator
+
+* Microsoft Safety Scanner
+  https://learn.microsoft.com/en-us/defender-endpoint/safety-scanner-download
+
+* Microsoft Defender Offline Scan
+  https://learn.microsoft.com/en-us/defender-endpoint/microsoft-defender-offline
+
+---
+
+## Step 1: Checked Autoruns Startup Entries
+
+Autoruns showed broken Chrome-related startup entries in yellow, marked as `File not found`.
+
+Examples:
+
+```text
+Google Chrome — File not found
+Google Chrome — File not found
+Google Platform Experience Helper — File not found
+GoogleUpdaterTaskUser147... — File not found
+```
+
+These were initially disabled, but after reboot, the Windows Installer popups still appeared.
+
+Conclusion: the broken Chrome entries were leftovers, but they were not the main trigger.
+
+---
+
+## Step 2: Checked Windows Installer Events
+
+PowerShell was used to inspect recent Windows Installer events:
+
+```powershell
+Get-WinEvent -FilterHashtable @{
+  LogName='Application'
+  ProviderName='MsiInstaller'
+  StartTime=(Get-Date).AddHours(-2)
+} | Select-Object TimeCreated, Id, ProviderName, Message | Format-List
+```
+
+The output repeatedly showed:
+
+```text
+C:\Program Files\WindowsApps\Microsoft.GamingServices_...\gameinputredist.msi
+Product: Microsoft GameInput
+Reconfiguration success or error status: 0
+```
+
+This made Microsoft Gaming Services / GameInput look suspicious at first.
+
+Gaming Services was repaired, removed, and reinstalled from the Microsoft Store. Its services were confirmed running:
+
+```powershell
+Get-AppxPackage Microsoft.GamingServices -AllUsers |
+Select-Object Name, Version, PackageFullName, InstallLocation
+```
+
+```powershell
+Get-Service *Gaming*,*GameInput* |
+Select-Object Name, DisplayName, Status, StartType
+```
+
+Gaming Services was installed and running correctly.
+
+Conclusion: Gaming Services was noisy in Event Viewer, but it was not the source of the three popup errors.
+
+---
+
+## Step 3: Identified the Real Parent Process
+
+The key step was checking active installer processes while the popups were still open.
+
+```powershell
+Get-CimInstance Win32_Process |
+Where-Object { $_.Name -match 'msiexec|installer|setup|gameinput|gaming' } |
+Select-Object ProcessId, ParentProcessId, Name, CommandLine |
+Format-List
+```
+
+This revealed the real cause:
+
+```text
+msiexec.exe /i "C:\ProgramData\GeneralAISupport2Solutions\GeneralAISupport2\updates\Update\Setup.msi" ADDLOCAL=MainFeature,CHROMEINSTALLER
+
+msiexec.exe /i "C:\ProgramData\FutureSpaceThreeSolutions\FutureSpaceThree\updates\Update\Setup.msi" ADDLOCAL=MainFeature,CHROMEINSTALLER
+```
+
+The parent process was:
+
+```text
+svchost.exe -k netsvcs -p -s Schedule
+```
+
+That confirmed Task Scheduler was launching malicious or leftover installer tasks.
+
+Conclusion: the Windows Installer popups were caused by scheduled-task persistence from the previous browser hijacker.
+
+---
+
+## Step 4: Killed the Bad MSI Processes
+
+PowerShell Administrator:
+
+```powershell
+Get-CimInstance Win32_Process |
+Where-Object {
+  $_.CommandLine -match 'GeneralAISupport2|FutureSpaceThree|Setup\.msi|CHROMEINSTALLER'
+} |
+ForEach-Object {
+  Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+}
+```
+
+---
+
+## Step 5: Found the Malicious Scheduled Tasks
+
+PowerShell Administrator:
+
+```powershell
+$badTasks = Get-ScheduledTask | Where-Object {
+  ($_.Actions | Out-String) -match 'GeneralAISupport2|FutureSpaceThree|Setup\.msi|CHROMEINSTALLER'
+}
+
+$badTasks | Select-Object TaskName, TaskPath, State, Actions | Format-List
+```
+
+The suspicious tasks found were:
+
+```text
+WorldWideWeb
+{5862B490-06BF-467A-B4B1-5AA06B848048}
+{EAF4CC3C-99E0-4AFE-83B1-7E9F39F4818F}
+{F54E7186-50C6-42F7-ACE9-A36954AA9C7E}
+```
+
+---
+
+## Step 6: Disabled and Deleted the Bad Scheduled Tasks
+
+PowerShell Administrator:
+
+```powershell
+$badTasks | ForEach-Object {
+  Disable-ScheduledTask -TaskName $_.TaskName -TaskPath $_.TaskPath -ErrorAction SilentlyContinue
+  Unregister-ScheduledTask -TaskName $_.TaskName -TaskPath $_.TaskPath -Confirm:$false -ErrorAction SilentlyContinue
+}
+```
+
+---
+
+## Step 7: Removed Suspicious Leftover Folders
+
+PowerShell Administrator:
+
+```powershell
+$badPaths = @(
+  "C:\ProgramData\GeneralAISupport2Solutions",
+  "C:\ProgramData\FutureSpaceThreeSolutions",
+  "C:\Program Files (x86)\GeneralAISupport2Solutions",
+  "C:\Program Files (x86)\FutureSpaceThreeSolutions",
+  "$env:LOCALAPPDATA\DGoogle",
+  "$env:LOCALAPPDATA\DDapps",
+  "$env:LOCALAPPDATA\EMicrosoft",
+  "C:\ProgramData\Chromnius",
+  "C:\ProgramData\ChromniusEdge"
+)
+
+foreach ($p in $badPaths) {
+  if (Test-Path $p) {
+    Remove-Item $p -Recurse -Force -ErrorAction SilentlyContinue
+    Write-Host "Removed or attempted: $p"
+  }
+}
+```
+
+Removed or attempted paths included:
+
+```text
+C:\ProgramData\GeneralAISupport2Solutions
+C:\ProgramData\FutureSpaceThreeSolutions
+C:\Program Files (x86)\FutureSpaceThreeSolutions
+```
+
+---
+
+## Step 8: Verified Scheduled Task Persistence Was Gone
+
+PowerShell Administrator:
+
+```powershell
+Get-ScheduledTask | Where-Object {
+  ($_.Actions | Out-String) -match 'GeneralAISupport2|FutureSpaceThree|Setup\.msi|CHROMEINSTALLER|NetOne|NetSix|Chromnius|DGoogle|DDapps|EMicrosoft'
+} | Select-Object TaskName, TaskPath, State, Actions | Format-List
+```
+
+Expected result:
+
+```text
+No output
+```
+
+Actual result:
+
+```text
+No output
+```
+
+---
+
+## Step 9: Verified No Bad MSI Processes Were Running
+
+PowerShell Administrator:
+
+```powershell
+Get-CimInstance Win32_Process |
+Where-Object {
+  $_.CommandLine -match 'GeneralAISupport2|FutureSpaceThree|Setup\.msi|CHROMEINSTALLER'
+} |
+Select-Object ProcessId, ParentProcessId, Name, CommandLine
+```
+
+Expected result:
+
+```text
+No output
+```
+
+Actual result:
+
+```text
+No output
+```
+
+---
+
+## Step 10: Verified Microsoft Defender Exclusions Were Clean
+
+PowerShell Administrator:
+
+```powershell
+Get-MpPreference | Select-Object -ExpandProperty ExclusionPath
+```
+
+Expected result:
+
+```text
+Blank output
+```
+
+Actual result:
+
+```text
+Blank output
+```
+
+---
+
+## Step 11: Verified Suspicious Folders Were Gone
+
+PowerShell Administrator:
+
+```powershell
+Test-Path "C:\ProgramData\GeneralAISupport2Solutions"
+Test-Path "C:\ProgramData\FutureSpaceThreeSolutions"
+Test-Path "C:\Program Files (x86)\FutureSpaceThreeSolutions"
+```
+
+Expected result:
+
+```text
+False
+False
+False
+```
+
+Actual result:
+
+```text
+False
+False
+False
+```
+
+---
+
+## Step 12: Cleaned Up Orphaned Autoruns Entries
+
+After the popups were confirmed gone, leftover yellow `File not found` Google entries were deleted from Autoruns.
+
+Deleted entries included:
+
+```text
+Google Chrome — File not found
+Google Chrome — File not found
+Google Chrome — File not found
+Google Platform Experience Helper — File not found
+GoogleUpdaterTaskUser147... — File not found
+```
+
+Kept valid Google entries such as:
+
+```text
+Google Chrome Installer — valid current Chrome path
+GoogleUpdaterTaskSystem — valid path
+GoogleChromeElevationService — valid path
+GoogleUpdaterInternalService — valid path
+GoogleUpdaterService — valid path
+```
+
+---
+
+## Final Result
+
+After removing the malicious scheduled tasks and leftover folders:
+
+* No more Windows Installer popups appeared after reboot
+* No malicious MSI processes were running
+* No suspicious scheduled tasks remained
+* Microsoft Defender exclusions were blank
+* Suspicious ProgramData folders were removed
+* Broken Autoruns leftovers were cleaned up
+
+The issue was resolved.
+
+---
+
+## Root Cause
+
+The root cause was not Chrome itself and not Microsoft Gaming Services.
+
+The real cause was leftover scheduled-task persistence from a previous browser hijacker. The scheduled tasks attempted to launch missing MSI installers from suspicious folders:
+
+```text
+C:\ProgramData\GeneralAISupport2Solutions
+C:\ProgramData\FutureSpaceThreeSolutions
+```
+
+The MSI command included:
+
+```text
+ADDLOCAL=MainFeature,CHROMEINSTALLER
+```
+
+This strongly suggests the malware or unwanted software was attempting to reinstall or repair a fake Chrome-related component.
+
+---
+
+## Key Lessons
+
+When Windows Installer popups appear at every boot:
+
+1. Do not assume the visible app is the root cause.
+2. Use Autoruns to check startup entries.
+3. Use Event Viewer to inspect MSI events.
+4. Use PowerShell to inspect active `msiexec.exe` command lines.
+5. Check parent process IDs to see whether Task Scheduler is launching the installer.
+6. Search scheduled tasks by action command, not only by task name.
+7. Check Defender exclusions after any browser hijacker infection.
+8. Remove orphaned scheduled tasks and suspicious folders.
+9. Do not manually delete protected WindowsApps folders.
+10. Run a full malware scan after cleanup.
+
+---
+
+## Useful Commands
+
+Find active installer-related processes:
+
+```powershell
+Get-CimInstance Win32_Process |
+Where-Object { $_.Name -match 'msiexec|installer|setup|gameinput|gaming' } |
+Select-Object ProcessId, ParentProcessId, Name, CommandLine |
+Format-List
+```
+
+Find suspicious scheduled tasks by action:
+
+```powershell
+Get-ScheduledTask | Where-Object {
+  ($_.Actions | Out-String) -match 'GeneralAISupport2|FutureSpaceThree|Setup\.msi|CHROMEINSTALLER|NetOne|NetSix|Chromnius|DGoogle|DDapps|EMicrosoft'
+} | Select-Object TaskName, TaskPath, State, Actions | Format-List
+```
+
+Check Defender exclusions:
+
+```powershell
+Get-MpPreference | Select-Object -ExpandProperty ExclusionPath
+```
+
+Check suspicious folder existence:
+
+```powershell
+Test-Path "C:\ProgramData\GeneralAISupport2Solutions"
+Test-Path "C:\ProgramData\FutureSpaceThreeSolutions"
+Test-Path "C:\Program Files (x86)\FutureSpaceThreeSolutions"
+```
+
+---
+
+## Recommended Follow-Up
+
+Run a full malware scan:
+
+Microsoft Safety Scanner:
+https://learn.microsoft.com/en-us/defender-endpoint/safety-scanner-download
+
+Run Microsoft Defender Offline Scan:
+
+https://learn.microsoft.com/en-us/defender-endpoint/microsoft-defender-offline
+
+Use Autoruns for future startup inspection:
+
+https://learn.microsoft.com/en-us/sysinternals/downloads/autoruns
